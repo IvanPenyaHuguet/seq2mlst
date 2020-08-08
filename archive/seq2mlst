@@ -1,0 +1,752 @@
+#!/usr/bin/env python
+
+# seq2mlst
+# Created by Laura Carroll
+# lmc297@cornell.edu
+
+# import required packages
+import argparse, sys, os, glob, requests, re
+import xml.etree.ElementTree as ET
+	
+
+# parse arguments
+parser = argparse.ArgumentParser(usage='seq2mlst -i </path/to/input/file.extension> -o </path/to/desired/output_directory/> -t [input data format (seq, pe, se, sra, or sra-get)] -m ["Genus species", in quotation marks ("Salmonella enterica", "Listeria monocytogenes", etc.)] [-other options]')
+parser.add_argument('-i','--input', nargs='+', help='Enter the path to the bacterial sequence data you would like to input, or enter an SRA accession number',required=True)
+parser.add_argument('-o', '--output', nargs='+', help='Specify a path to your desired output directory',required=True)
+parser.add_argument('-t', '--type', nargs='+', help='Specify your type of data: seq for genomes or contigs in fasta format, pe for paired-end Illumina reads, se for single-end Illumina reads, sra for a sra file, or sra-get with an SRA accession number',required=True)
+parser.add_argument('--draft_genome', action='store_true', default=False, help='Optional argument for use with contigs in fasta format; concatenates draft genome contigs into pseudochromosome')
+parser.add_argument('-m', '--mlst', nargs='+', help='Specify bacterial database to use for MLST, surrounded by quotation marks, e.g. "Salmonella enterica", "Staphylococcus aureus", "Listeria monocytogenes", etc.', required=True)
+parser.add_argument('--spades_m', nargs='?', default=250, help='Optional argument for use with Illumina reads; integer; set SPAdes memory limit -m/--memory option in Gb; default is 250 Gb, the default for SPAdes')
+parser.add_argument('--spades_t', nargs='?', default=16, help='Optional argument for use with Illumina reads; integer; set number of threads to use for SPAdes -t/--threads option; default is 16, the default for SPAdes')
+parser.add_argument('--spades_k', nargs='?', default=77, help='Optional argument for use with Illumina reads; comma-separated list of integers; set k-mer sizes to use with SPAdes -k option; default is 77')
+parser.add_argument('--version', action="version", version='%(prog)s 1.0.1', help="Print version")
+
+args=parser.parse_args()
+
+# check for biopython installation
+try:
+	from Bio.Blast.Applications import NcbiblastnCommandline, NcbitblastnCommandline
+	from Bio import SeqIO
+	from Bio.Blast import NCBIXML
+except ImportError:
+	print "Scanning for BioPython installation..."
+	try:
+		cellar=os.popen('brew ls seq2mlst| grep "seq_mlst_db"').read()
+		mlst_path = cellar.split("seq_mlst_db")[0].strip()
+		pysearch=mlst_path.split("/bin/")[0]+"/libexec/lib/python2.7/site-packages/"
+		print pysearch
+		sys.path.append(pysearch.strip())
+		from Bio.Blast.Applications import NcbiblastnCommandline, NcbitblastnCommandline
+	       	from Bio import SeqIO
+	      	from Bio.Blast import NCBIXML
+	except (ImportError,OSError) as e:
+		print "Could not find BioPython installed. Exiting seq2mlst..."
+		sys.exit()
+
+# check for subprocess
+try:
+	import subprocess as sb
+except ImportError:
+	print "Could not find subprocess installed. Exiting seq2mlst..."
+	sys.exit()
+
+# path to program seq2mlst.py, as well as databases
+# check if homebrew is installed
+try:
+	sb.check_call('brew ls seq2mlst|grep "seq_mlst_db"', shell=True )
+	cellar=os.popen('brew ls seq2mlst|grep "seq_mlst_db"').read()
+	mlst_path=cellar.split("seq_mlst_db")[0].strip()
+except sb.CalledProcessError:
+	print "Brew not installed"
+	mlst_path = os.path.realpath(__file__)	
+	mlst_list = mlst_path.split("/")[:-1]
+	mlst_path = '/'.join(mlst_list) + "/"	
+
+
+
+
+# split arguments provided by user
+def arg_splitter(argin):
+	return str(argin).strip("[']")
+
+iarg=arg_splitter(args.input)
+oarg=arg_splitter(args.output)
+targ=arg_splitter(args.type)
+marg=arg_splitter(args.mlst)
+spadesm=arg_splitter(args.spades_m)
+spadest=arg_splitter(args.spades_t)
+spadesk=arg_splitter(args.spades_k)
+dgarg=arg_splitter(args.draft_genome)
+
+
+
+# append to output directory argument, if necessary
+if oarg[-1]!="/":
+	oarg=oarg+"/"
+
+
+# check if file exists and isn't empty
+def file_check(input_file):
+	try:
+		if os.stat(input_file).st_size > 0:
+			print input_file+" exits. Continuing..."
+			return iarg
+		else:
+			print "Your input file {0} is empty! Please use a different input file.".format(input_file)
+		sys.exit()
+	except OSError:
+		print "Your input file {0} does not exist. Please make sure your path and file name are correct, or specify a different input file.".format(input_file)
+		sys.exit()
+
+# dbparse: creates dictionary mapping mlst id names from a given database to their respective sequences
+def dbparse(db_path):
+	argseq={}
+	infile=open(db_path,"r")
+	for record in SeqIO.parse(infile, "fasta"):
+		seqid=str(record.description).strip()
+		newid=re.sub('[^0-9a-zA-Z]+', '_', seqid)
+		seqseq=str(record.seq).strip()
+		seqlen=len(seqseq)
+		if newid not in argseq.keys():
+			argseq[newid]=seqseq
+	infile.close()
+	return argseq
+
+# seqparse: creates dictionary that maps query sequence IDs to sequences
+def seqparse(seq_path):
+	newseq={}
+	newinfile=open(seq_path,"r")
+	for record in SeqIO.parse(newinfile, "fasta"):
+		seqid=str(record.id).strip()
+		newid=re.sub('[^0-9a-zA-Z]+', '_', seqid)
+		seqseq=str(record.seq).strip()
+		reduced_seq=seqseq.replace("N","")
+		if newid not in newseq.keys():
+			newseq[newid]=seqseq
+	newinfile.close()
+	return newseq
+
+# make_blast_xml: takes sequences, makes blast xml file for each
+def make_blast_xml(newseq,argdict,query_path,task,shorttask,evalue_thresh,pident_thresh,qcov_thresh):
+	# for each sequence in the newseq dictionary
+	for key in newseq.keys():
+		# count the sequences
+		counter=1
+		# call query sequence queryseq
+		queryseq=newseq[key]
+		# get the length of the queryseq (genelen)
+		genelen=len(queryseq)
+		# create a temporary query file with the gene sequence and id
+		queryfile=open(oarg+key.strip()+"_querytemp.fasta","a")
+		print >> queryfile, ">"+key.strip()
+		print >> queryfile, queryseq
+		queryfile.close()
+		# check if final results directory exists
+		if os.path.isdir(oarg+"seq2mlst_final_results"):
+			print "Final results directory exists."
+		# if not, make one
+		else:
+			os.system("mkdir "+oarg+"seq2mlst_final_results")
+		# check if isolatefiles directory exists within final results directory
+		if not os.path.isdir(oarg+"seq2mlst_final_results/isolatefiles"):
+			os.system("mkdir "+oarg+"seq2mlst_final_results/isolatefiles")
+		rdir_root=oarg+"seq2mlst_final_results/isolatefiles/"+key#.split(".fasta")[0]
+		rdir=rdir_root+"_results/"
+		#print rdir_root
+		# make a results directory for each sequence
+		if not os.path.isdir(rdir_root+"_results"):
+			os.system("mkdir "+rdir_root+"_results")
+		# create a database out of the temporary query file with the individual sequence
+		if os.path.isfile(oarg+key.strip()+"_querytemp.fasta.nsq"):
+			print "Database already exists."
+		else:
+			os.system("makeblastdb -in "+oarg+key.strip()+"_querytemp.fasta -dbtype nucl")
+		out=rdir_root+"_blast_results.xml"
+		# create final file named for each isolate if necessary
+		finalfile_string=key.strip()+"_final_results.txt"
+		if not os.path.isfile(oarg+"seq2mlst_final_results/"+finalfile_string):
+			finalfile=open(oarg+"seq2mlst_final_results/"+finalfile_string,"a")
+			print >> finalfile, "seq2mlst Results for "+key
+			print >> finalfile, ""
+			finalfile.close()
+		if not os.path.isdir(oarg+"seq2mlst_final_results/genefiles"):
+			os.system("mkdir "+oarg+"seq2mlst_final_results/genefiles")
+		if not os.path.isdir(oarg+"seq2mlst_final_results/isolatefiles"):
+			os.system("mkdir "+oarg+"seq2mlst_final_results/isolatefiles")
+		# open the final file for the isolate
+		finalfile=open(oarg+"seq2mlst_final_results/"+finalfile_string,"a")
+		# run blast with query=database of sequences, db = querytemp.fasta with single isolate sequence, out = outdir, outfmt = xml
+		cline=NcbiblastnCommandline(query=str(query_path),db=oarg+key.strip()+"_querytemp.fasta",out=str(out),outfmt='"5"')
+		stdout, stderr = cline()
+		#remove temporary temporary fasta files
+		os.system("rm "+oarg+key.strip()+"_querytemp.fasta*")
+		# parse blast xml files according to task
+		parse_panC(xml=out,rdir=rdir,rdir_root=rdir_root,key=key,counter=counter,shorttask=shorttask,finalfile_string=finalfile_string,evalue_thresh=evalue_thresh,pident_thresh=pident_thresh,qcov_thresh=qcov_thresh)
+
+# dictionary_add: create a new entry for a dictionary, or append if it already exists as a key
+def dictionary_add(dict_name,key,blast):
+	if key not in dict_name.keys():
+		dict_name[key]=[]
+		dict_name[key].append(blast)
+	else:
+		dict_name[key].append(blast)
+
+# print_virulence_gene_report: prints isolatefiles and genefiles
+def print_virulence_gene_report(filtres,maxgene, genequery,key,rdir,shorttask):
+	print >> filtres, "\t".join([str(m).strip() for m in maxgene])
+	genequery=str(genequery).strip()
+	genequery=re.sub('[^0-9a-zA-Z]+', '_', genequery)
+	genequery=genequery.strip()
+	genequery_short=re.split(r'[-_]+',genequery)[0]
+	# print to genefile (genefile=1 per gene, with all isolates' sequences)
+	genefile=open(oarg+"seq2mlst_final_results/genefiles/"+genequery_short+"_genefile.fasta","a")
+	print >> genefile, ">"+key+"___"+genequery
+	print >> genefile, str(maxgene[14]).strip()
+	genefile.close()
+
+
+
+
+
+
+# print_final_report: print to the final report file i.e. BTyper's final output file
+def print_final_report(finalfile_string, shorttask, maxgene):
+	finalout=open(oarg+"seq2mlst_final_results/"+finalfile_string,"a")	
+	finalout.close()
+
+# get_st: parse mlst output for final report file; gives ST from database of STs and ATs
+def get_st(mlst_infile, st_file, finalfile_string,mlst_genes):
+	mlstdict={}	
+	lowconf=[]
+	for line in mlst_infile:
+		splits=line.split("\t")
+		if targ:
+			if "alignment_title" not in line:
+				alleleid=splits[3]
+				geneid=re.split(r'[-_]+',str(alleleid))[0]
+				at=re.split(r'[-_]+',str(alleleid))[1]
+				mlstdict[str(geneid).strip()]=str(at).strip()
+				pid=splits[8]
+				qid=splits[7]	
+				if float(pid.strip())<100 or float(qid.strip())<100:
+					lowconf.append(geneid.strip())
+	
+	mlst_infile.close()
+	stdict={}
+	stfile=open(st_file,"r")
+	for line in stfile:
+		splits=line.split("\t")
+		st=splits[0]
+		all_at=splits[1:len(filelist)]
+		dictionary_add(stdict,str(st).strip(),[a.strip() for a in all_at])
+	stfile.close()	
+	st_order=[s for i in stdict["ST"] for s in i]
+	myst=[]
+	for s in st_order:
+		if s in mlstdict.keys():
+			myst.append(mlstdict[s])
+		else:
+			myst.append("?")
+
+	
+	finalfile=open(finalfile_string,"a")
+	print >> finalfile, "Predicted MLST Profile:"
+	print >> finalfile, ""
+	print >> finalfile, "ST"+"\t"+"\t".join([str(mg).split(".fas")[0] for mg in mlst_genes])
+	if "?" in myst:
+		finalmm=[]
+		for mm,tt in zip(myst,mlst_genes):
+			testmlst=tt.split(".fas")[0]
+			if testmlst.strip() in lowconf:
+				finalmm.append(mm+"*")
+			else:
+				finalmm.append(mm)
+		finalfile=open(finalfile_string,"a")
+		if "*" in str(finalmm):	
+			print >> finalfile, "?*"+"\t"+"\t".join([str(m).strip() for m in finalmm])
+			print >> finalfile, "*No allele in the current database matches with 100% identity and coverage."
+		else:
+			print >> finalfile, "?"+"\t"+"\t".join([str(m).strip() for m in finalmm])
+		print >> finalfile, ""
+		finalfile.close()
+	else:
+		confirmst=0
+		for stkey in stdict.keys():
+			st_match2=[s for i in stdict[stkey] for s in i]
+			if myst==st_match2:
+				confirmst=1
+				finalmm=[]
+				print "Found matching ST."
+				for mm,tt in zip(myst,mlst_genes):
+					testmlst=tt.split(".fas")[0]
+					if testmlst.strip() in lowconf:
+						finalmm.append(mm+"*")
+					else:
+						finalmm.append(mm)
+						
+				if "*" in str(finalmm):
+					stkey=stkey.strip()+"*"	
+				finalfile=open(finalfile_string,"a")
+				print >> finalfile, stkey.strip()+"\t"+"\t".join([str(m).strip() for m in finalmm])
+				if "*" in stkey:
+					print >> finalfile, "*No allele in the current database matches with 100% identity and coverage."
+				print >> finalfile, ""
+				finalfile.close()
+		if confirmst==0:
+			finalmm=[]
+			for mm,tt in zip(myst,mlst_genes):
+				testmlst=tt.split(".")[0]
+				if testmlst.strip() in lowconf:
+					finalmm.append(mm+"*")
+				else:
+					finalmm.append(mm)
+			if "*" in str(finalmm):
+				stkey="?*"
+			else:
+				stkey="?"
+			finalfile=open(finalfile_string,"a")
+			print >> finalfile, stkey.strip()+"\t"+"\t".join([str(m).strip() for m in finalmm])
+			if "*" in stkey:
+				print >> finalfile, "*No allele in the current database matches with 100% identity and coverage."
+			print >> finalfile, ""
+			finalfile.close()
+			
+			
+		
+
+# parse_blast_xml_seq: parse the blast xml output into results file
+def parse_blast_xml_seq(xml,rdir,rdir_root,key,counter,shorttask,finalfile_string,evalue_thresh,qcov_thresh,pident_thresh):
+	result_handle=open(xml)
+	blast_records=NCBIXML.parse(result_handle)
+	# open file in individual isolate results directory
+	filtres=open(rdir+key+"_"+shorttask+"_results.txt","a")
+	# print the header to the results file
+	headerlist=["hit_number","alignment_title","query_id",shorttask+"_gene_query","alignment_length","evalue","blast_bitscore","query_coverage","percent_idenity",shorttask+"_gene_start",shorttask+"_gene_end","genome_sequence_start","genome_sequence_end",shorttask+"_gene_sequence","genome_sequence","match_sequence"]
+	print >> filtres, "\t".join([h for h in headerlist])
+	# loop through each record in the blast output
+	for record in blast_records:
+		for alignment in record.alignments:
+			# create a dictionary for HSPs
+			hspdict={}
+			# for each hsp in the alignment
+			for hsp in alignment.hsps:
+				#query coverage (qcov) can be calculated as one of the following:
+				#qcov=float(float(len(hsp.sbjct))/float(len(hsp.query)))
+				qcov=float(hsp.align_length)/float(record.query_length)*100		
+				pident=float(hsp.identities)/float(hsp.align_length)*100
+				# add information for each HSP if the e-value is lower than the threshold
+				if hsp.expect<=evalue_thresh and qcov>=qcov_thresh and pident>=pident_thresh:
+					genefacts=[counter,alignment.title,record.query_id,record.query,hsp.align_length,hsp.expect,hsp.bits,qcov,pident,hsp.query_start,hsp.query_end,hsp.sbjct_start,hsp.sbjct_end,hsp.query,hsp.sbjct,hsp.match]
+					dictionary_add(hspdict,str(record.query).strip(),"\t".join([str(g).strip() for g in genefacts]))
+					# add the start and end positions of the hsp to hspdict
+			# loop through each hsp in the alignment
+			for hkey in hspdict.keys():
+				# get values (start and end locations of each hsp, bit score)
+				hsps=hspdict[hkey]
+				# if more than 1 hsp exists (i.e. there is a chance that overlapping hsps might exist)
+				if len(hsps)>1:
+					# create list to check for overlapping HSPs
+					allnums=[]
+					# loop through each HSP
+					for h in hsps:
+						hsplits=h.split("\t")
+						# get genome start position
+						gstart=hsplits[11]
+						gstart=int(gstart.strip())
+						# get genome end position
+						gend=hsplits[12]
+						gend=int(gend.strip())
+						if gstart<gend:
+							# append sequence of base numbers covered by HSP to list
+							allnums.append(range(gstart,gend+1,1))
+						else:
+							allnums.append(range(gend, gstart+1,1))
+					# get the intersection of genome positions when more than one HSP exists in the genome
+					inset=set.intersection(*map(set,allnums))
+					# if an intersection exists (i.e. there are overlapping HSPs)
+					if inset:
+						# loop through HSPs, keeping track of HSP with highest bit score
+						maxbits=0
+						for h in hsps:
+							hsplits=h.split("\t")
+							# get bit score of current HSP
+							testbits=hsplits[6]
+							# if bit score of current HSP is larger than current maximum bit score:
+							if float(testbits.strip())>maxbits:
+								# the current bit score becomes the max
+								maxbits=float(testbits.strip())
+								# the current dictionary information becomes the best gene information
+								maxgene=hsplits
+								# the current gene query becomes the best gene query
+								genequery=maxgene[3]
+						# print the best-scoring HSP to the isolatefiles and genefiles
+						counter=counter+1
+						print_virulence_gene_report(filtres=filtres, maxgene=maxgene, genequery=genequery, key=key, rdir=rdir, shorttask=shorttask)
+						print_final_report(finalfile_string=finalfile_string, shorttask=shorttask, maxgene=maxgene)
+					# if no intersection exists, i.e. there are multiple HSPs, but they are found in different regions of the genome:
+					else:
+						# loop through each nonoverlapping HSP
+						for h in hsps:
+							maxgene=h.split("\t")
+							genequery=maxgene[3]
+							# print each HSP to the appropriate isolatefile/genefile
+							counter=counter+1
+							print_virulence_gene_report(filtres=filtres, maxgene=maxgene, genequery=genequery, key=key, rdir=rdir, shorttask=shorttask)
+							print_final_report(finalfile_string=finalfile_string, shorttask=shorttask, maxgene=maxgene)
+
+				# if there is only 1 HSP
+				else:
+					for h in hsps:
+						maxgene=h.split("\t")
+						genequery=maxgene[3]
+						#print it to the appropriate isolatefile/genefile
+						counter=counter+1
+						print_virulence_gene_report(filtres=filtres, maxgene=maxgene, genequery=genequery, key=key, rdir=rdir, shorttask=shorttask)
+						print_final_report(finalfile_string=finalfile_string, shorttask=shorttask, maxgene=maxgene)
+	filtres.close()
+	if shorttask=="virulence" and amrarg=="False":
+		prune_alleles(finalpath=finalfile_string)
+	elif shorttask=="amr":
+		prune_alleles(finalpath=finalfile_string)
+
+# parse_panC: parse blast output for panC task 
+def parse_panC(xml,rdir,rdir_root,key,counter,shorttask,finalfile_string,evalue_thresh,qcov_thresh,pident_thresh):
+	counter=0
+        result_handle=open(xml)
+        blast_records=NCBIXML.parse(result_handle)
+        # open file in individual isolate results directory
+        filtres=open(rdir+key+"_"+shorttask+"_results.txt","a")
+        # print the header to the results file
+        headerlist=["hit_number","alignment_title","query_id",shorttask+"_gene_query","alignment_length","evalue","blast_bitscore","query_coverage","percent_idenity",shorttask+"_gene_start",shorttask+"_gene_end","genome_sequence_start","genome_sequence_end",shorttask+"_gene_sequence","genome_sequence","match_sequence"]
+        print >> filtres, "\t".join([h for h in headerlist])
+        # loop through each record in the blast output
+	maxp=0 
+        for record in blast_records:
+                for alignment in record.alignments:
+                        # for each hsp in the alignment
+                        for hsp in alignment.hsps:
+                                #qcov=float(float(len(hsp.sbjct))/float(len(hsp.query)))
+                                qcov=float(hsp.align_length)/float(record.query_length)*100 
+                                pident=float(hsp.identities)/float(hsp.align_length)*100
+				testbits=float(hsp.bits)
+                                # add information for each HSP if the e-value is lower than the threshold
+                                if hsp.expect<=evalue_thresh and qcov>=qcov_thresh and testbits>=pident_thresh and testbits>maxp:
+					maxp=testbits
+                                        genefacts=[counter,alignment.title,record.query_id,record.query,hsp.align_length,hsp.expect,hsp.bits,qcov,pident,hsp.query_start,hsp.query_end,hsp.sbjct_start,hsp.sbjct_end,hsp.query,hsp.sbjct,hsp.match]
+        genefacts="\t".join([str(g).strip() for g in genefacts])
+	maxgene=genefacts.split("\t")
+	genequery=maxgene[3]
+        #print it to the appropriate isolatefile/genefile
+        counter=counter+1
+        print_virulence_gene_report(filtres=filtres, maxgene=maxgene, genequery=genequery, key=key, rdir=rdir, shorttask=shorttask)
+	print_final_report(finalfile_string=finalfile_string, shorttask=shorttask, maxgene=maxgene)
+        filtres.close()
+
+# assemble_reads: assemble genome from reads
+def assemble_reads_pe(forward,reverse):
+	os.system("spades.py -k "+spadesk+" --careful -1 "+forward+" -2 "+reverse+" -o "+oarg+"spades_assembly -t "+spadest+" -m "+spadesm)
+def assemble_reads_se(reads):
+	os.system("spades.py -k "+spadesk+" --careful -s "+reads+" -o "+oarg+"spades_assembly -t "+spadest+" -m "+spadesm)
+
+def fastq_check(reads):
+	if reads.endswith(".fastq"):
+		os.system("gzip reads")
+		reads=reads.strip()+".gz"
+	if reads.endswith(".fastq.gz"):
+		return()
+	else:
+		print "It looks like your file "+reads.strip()+" does not end with either '.fastq.gz' or '.fastq'. Please make sure that you are supplying reads in fastq or fastq.gz format, and, if necessary, please rename your file with the appropriate extension."
+		sys.exit()
+
+def sra_check(sra):
+	if sra.endswith(".sra"):
+		return()
+	else:
+		print "It looks like your file "+reads.strip()+" does not end with '.sra'. Please make sure that you are supplying sequencing data in sra format, and, if necessary, please rename your file with the extension '.sra'."
+
+def prune_alleles(finalpath):
+	f=oarg+"seq2mlst_final_results/"+finalpath	
+	print "Pruning alleles for "+f+"..."
+	os.system("mv "+f+" "+f+"_temporary.txt")
+	old=open(f+"_temporary.txt","r")
+	new=open(f,"a")
+	bitdicta={}
+	bitdictv={}
+	for o in old:
+		if "BTyper Results for " in o:
+			print >> new, o.strip()
+			print >> new, ""
+		if "|" in o and "___" not in o and "rpoB|AT" not in o:
+			print >> new, o.strip()
+		elif "|" in o and "___" in o and "rpoB|AT" not in o:	
+			splits=o.split("\t")
+			gname=splits[1]	
+			gpref=gname.split("___")[0]
+			gsuff=gname.split("___")[1]
+			testbits=splits[5]
+			if "vir" in gpref:
+				bitdict=bitdictv
+			elif "amr" in gpref:
+				bitdict=bitdicta
+			if gpref.strip() not in bitdict:
+				bitdict[gpref.strip()]=[]
+				bitdict[gpref.strip()].append(gsuff.strip())
+				for s in splits[2:]:
+					bitdict[gpref.strip()].append(str(s).strip())	
+			else:
+				maxlist=bitdict[gpref.strip()]
+				maxbits=maxlist[4]
+				if float(testbits.strip())>float(maxbits.strip()):
+					bitdict[gpref.strip()]=[]
+					bitdict[gpref.strip()].append(gsuff.strip())
+					for s in splits[2:]:
+						bitdict[gpref.strip()].append(str(s).strip())
+
+	old.close()
+	dicts=[bitdictv,bitdicta]
+	if bool(dicts[0])==False and bool(dicts[1])==False:
+		if varg=="True":
+			print >> new, "Predicted Virulence Genes:"
+                        print >> new, ""
+                        header=["Hit #","Virulence Gene Name","E-Value Percent (%) Identity","Percent (%) Coverage"]
+                        print >> new, "\t".join([h for h in header])
+		if amrarg=="True":
+			print >> new, "Predicted AMR Genes:"
+                        print >> new, ""
+                        header=["Hit #","AMR Gene Name","E-Value Percent (%) Identity","Percent (%) Coverage"]
+                        print >> new, "\t".join([h for h in header])
+	else:
+		for bitdict in dicts:
+			counter=0
+			if varg=="True" and bitdict==bitdictv:
+				print >> new, "Predicted Virulence Genes:"
+				print >> new, ""
+				header=["Hit #","Virulence Gene Name","E-Value Percent (%) Identity","Percent (%) Coverage"]
+				print >> new, "\t".join([h for h in header])
+			elif amrarg=="True" and bitdict==bitdicta:
+				print >> new, "Predicted AMR Genes:"
+				print >> new, ""
+				header=["Hit #","AMR Gene Name","E-Value Percent (%) Identity","Percent (%) Coverage"]
+				print >> new, "\t".join([h for h in header])
+			for key in bitdict.keys():
+				counter=counter+1
+				finalg=bitdict[key]
+				print >> new, str(counter)+"\t"+"\t".join([str(fg).strip() for fg in finalg[:-2]])
+				shortgene=finalg[0].split("|")[0]
+				genefile=open(oarg+"seq2mlst_final_results/genefiles/"+shortgene.strip()+"_genefile.fasta","a")
+				isoname=f.split("/")[-1]
+				print >> genefile, ">"+isoname.strip()+"___"+shortgene
+				print >> genefile, finalg[-1].strip()
+				genefile.close()
+			print >> new, ""
+	new.close()
+	os.system("rm "+f+"_temporary.txt")
+				
+def parseXML(xml):
+	tree=ET.parse(xml)
+	root=tree.getroot()
+	species={}
+	for parent in root.iter("species"):
+		species[parent.text.strip()]=[]
+		for child in parent.iter("url"):
+			species[parent.text.strip()].append(child.text)
+	return species
+
+def levenshtein(s1, s2):
+	# courtesy of https://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Levenshtein_distance#Python
+	if len(s1) < len(s2):
+		return levenshtein(s2, s1)
+	# len(s1) >= len(s2)
+	if len(s2) == 0:
+		return len(s1)
+	
+	previous_row = range(len(s2) + 1)
+	for i, c1 in enumerate(s1):
+		current_row = [i + 1]
+		for j, c2 in enumerate(s2):
+			insertions = previous_row[j + 1] + 1
+			deletions = current_row[j] + 1
+			substitutions = previous_row[j] + (c1 != c2)
+			current_row.append(min(insertions, deletions, substitutions))
+		previous_row = current_row
+	return previous_row[-1]
+
+
+def matchmarg(mm, dictionary):
+	if mm in pubmlst.keys():
+		filelist=[]
+		urlcol=pubmlst[mm]
+		for u in urlcol:
+			resp=requests.get(u)
+			fname=u.split("/")[-1]
+			if fname.strip() and "." in fname.strip():
+				filelist.append(fname)
+				with open(mlst_path+"seq_mlst_db/"+fname.strip(),"wb") as f:
+					f.write(resp.content)
+		return filelist
+	else:
+		levs={}
+		for key in pubmlst.keys():
+			levnum=levenshtein(mm,key)
+			if levnum<=5 or mm in key:
+				levs[key]=levnum
+		levs=sorted(levs.items(), key=lambda x: x[1])
+		print "No MLST database found for "+mm+"."
+		if len(levs)>0:
+			print "Maybe you meant one of the following organisms:"
+			print ""
+			print "\n".join([l[0].strip() for l in levs])
+			print ""
+			print "Please re-type the name of the organism you would like to use, or type 'exit' to exit seq2mlst."
+			newmm=raw_input("Organism: ")
+			if newmm.replace("'","").replace('"',"").strip()=="exit":
+				print "Exiting seq2mlst..."
+				sys.exit()
+			else:
+				finaltry=matchmarg(mm=newmm,dictionary=pubmlst)
+				return finaltry
+		else:
+			print "Exiting seq2mlst..."
+			sys.exit()
+
+# fetch MLST sequences and definitions	
+if os.path.exists(mlst_path+"seq_mlst_db/pubmlst.xml"):
+	os.system("rm "+mlst_path+"seq_mlst_db/pubmlst.xml")
+url="https://pubmlst.org/data/dbases.xml"
+resp=requests.get(url)
+with open(mlst_path+"seq_mlst_db/pubmlst.xml", "wb") as f:
+	f.write(resp.content)
+pubmlst=parseXML(mlst_path+"seq_mlst_db/pubmlst.xml")
+filelist=matchmarg(mm=marg,dictionary=pubmlst)
+
+
+###
+
+# run program based on user input
+if targ!="seq":
+	os.system("mkdir "+oarg+"spades_assembly")
+	if targ=="pe":
+		spacecount=iarg.count(" ")
+		if spacecount>1:
+			print "It looks like there may be whitespace in one or more of your file names. Please rename your file(s), and try again."
+			sys.exit()
+		elif spacecount==0:
+			print "It looks like you've chosen the paired-end reads (-t pe) option but have only supplied one file of reads. Please supply one forward reads file and one reverse reads file separated by a space, or select a different option for -t (se for single-end reads, sra for files in sra format, or sra-get to download sequencing data in SRA format)."
+			sys.exit()
+		else:
+			forward_reads=iarg.split(" ")[0]
+			reverse_reads=iarg.split(" ")[1]
+			forward_reads=re.sub("[,']","",forward_reads)
+			reverse_reads=re.sub("[,']","",reverse_reads)
+			fastq_check(forward_reads)
+			fastq_check(reverse_reads)
+			prefix=forward_reads.split(".fastq.gz")[0]
+			if "/" in prefix:
+				prefix=prefix.split("/")[-1]
+			assemble_reads_pe(forward=forward_reads,reverse=reverse_reads)
+	elif targ=="se":
+		sreads=iarg.strip()
+		fastq_check(sreads)
+		prefix=sreads.split(".fastq.gz")[0]
+		if "/" in prefix:
+			prefix=prefix.split("/")[-1]
+		assemble_reads_se(reads=sreads)
+	elif targ=="sra-get" or targ=="sra":
+		sra=iarg.strip()
+		if targ=="sra-get":
+			os.system("prefetch -v "+sra)
+			os.system("fastq-dump --outdir "+oarg+" --split-files --gzip ~/ncbi/public/sra/"+sra+".sra")
+		elif targ=="sra":
+			sra=iarg.split(".sra")[0]
+			os.system("fastq-dump --outdir "+oarg+" --split-files --gzip "+iarg.strip())
+		forward_reads=oarg+sra.strip()+"_1.fastq.gz"
+		fastq_check(forward_reads)
+		prefix=forward_reads.split(".fastq.gz")[0]
+		if "/" in prefix:
+			prefix=prefix.split("/")[-1]
+		if os.path.exists(oarg+sra+"_2.fastq.gz"):
+			reverse_reads=oarg+sra+"_2.fastq.gz"
+			fastq_check(reverse_reads)
+			assemble_reads_pe(forward=forward_reads,reverse=reverse_reads)
+		else:
+			assemble_reads_se(reads=forward_reads)
+	os.system("cp "+oarg+"spades_assembly/contigs.fasta "+oarg+prefix.strip()+"_spades_assembly.fasta")
+	contigs=open(oarg+prefix.strip()+"_spades_assembly.fasta","r")
+	pseudo=open(oarg+prefix.strip()+"_pseudochrom.fasta","a")
+	print >> pseudo, ">"+prefix.strip()
+	print >> pseudo, "".join(line.strip() for line in contigs if ">" not in line)
+	contigs.close()
+	pseudo.close()
+	targ="seq"
+	iarg=oarg+prefix.strip()+"_pseudochrom.fasta"
+
+
+
+
+# if the user inputs a fasta file
+if targ=="seq":
+	print "-t seq has been selected. Expecting a fasta file."
+	# check if the file is a fasta
+	file_check(iarg)
+	# if genome is a draft genome
+	if dgarg=="True":
+		prefix=iarg.split(".")[0]
+		if "/" in prefix:
+			prefix=prefix.split("/")[-1]
+		contigs=open(iarg,"r")
+		pseudo=open(oarg+prefix.strip()+"_pseudochrom.fasta","a")
+		print >> pseudo, ">"+prefix.strip()
+		print >> pseudo, "".join(line.strip() for line in contigs if ">" not in line)
+		contigs.close()
+		pseudo.close()
+		iarg=oarg+prefix.strip()+"_pseudochrom.fasta"
+	# create a dictionary from the user-supplied fasta, mapping ids to sequences 
+	dictionaries=seqparse(iarg)
+
+	
+	if filelist:
+		print filelist	
+		profiles=filelist[0]
+		mlst_genes=filelist[1:]
+		# get best-matching AT for each MLST gene
+		for mlst in mlst_genes:
+			query_path=mlst_path+"seq_mlst_db/"+mlst
+			mydb=dbparse(query_path)
+			task="Predicted MLST Profile:"
+			shorttask="mlst"
+			evalue_thresh=1e-5
+			pident_thresh=0
+			qcov_thresh=0
+			# run AT for each gene, if sequence deteced
+			try:
+				make_blast_xml(newseq=dictionaries,argdict=mydb,query_path=query_path,task=task,shorttask=shorttask,evalue_thresh=evalue_thresh,pident_thresh=pident_thresh,qcov_thresh=qcov_thresh)
+			except UnboundLocalError:
+				print "No sequences found for "+mlst
+		# loop through isolatefiles
+		for root, dirs, files in os.walk(oarg+"seq2mlst_final_results/isolatefiles/"):
+			for d in dirs:
+				dirroot=d.split("_results")[0]
+				# open mlst results file, and get ST from ATs
+				try:	
+					newf=open(oarg+"seq2mlst_final_results/isolatefiles/"+d+"/"+dirroot.strip()+"_mlst_results.txt","r")
+					finalfile_string=oarg+"seq2mlst_final_results/"+dirroot.strip()+"_final_results.txt"
+					ff=open(finalfile_string,"r")
+					flines=ff.readlines()	
+					if not any("Predicted MLST Profile" in fl.strip() for fl in flines):
+						get_st(mlst_infile=newf,st_file=mlst_path+"seq_mlst_db/"+profiles,finalfile_string=finalfile_string,mlst_genes=mlst_genes)
+				except IOError:
+					print "No sequences found for "+shorttask
+
+
+
+print "Multi-locus sequence typing complete...peace and blessins'"
+print ""
+print "Thank you for using seq2mlst!"
+print ""
+print "To cite seq2mlst, please use the following:"
+print "Carroll, Laura M. 2017. seq2mlst: In silico multi-locus sequence typing. Version 1.0.0."
+
+
+
+
+
