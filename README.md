@@ -1,6 +1,10 @@
 # seq2mlst
 ## *In silico* multi-locus sequence typing (MLST) for bacterial genomes
 
+## Fork
+
+This forked is for the version 1.0.1, in order to solve path problems with linux. Thanks lmc297 for the code. You can check all the information below.
+
 ## Overview
 
 Perform *in silico* multi-locus sequence typing (MLST) using bacterial genomic data and the MLST schemes at PubMLST
